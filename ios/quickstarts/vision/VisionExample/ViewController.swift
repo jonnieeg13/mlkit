@@ -17,10 +17,15 @@
 import MLImage
 import MLKit
 import UIKit
+import AVFoundation
+import AVKit
+import MobileCoreServices
+import MLKitPoseDetection
+import MLKitVision
 
 /// Main view controller class.
 @objc(ViewController)
-class ViewController: UIViewController, UINavigationControllerDelegate {
+class ViewController: UIViewController, UINavigationControllerDelegate, AVCaptureVideoDataOutputSampleBufferDelegate {
 
   /// A string holding current results from detection.
   var resultsText = ""
@@ -39,13 +44,37 @@ class ViewController: UIViewController, UINavigationControllerDelegate {
 
   // Image counter.
   var currentImage = 0
+  var currentMedia = 0
+
+  var player: AVPlayer?
+  var playerLayer: AVPlayerLayer?
+  var videoOutput: AVPlayerItemVideoOutput?
+  var displayLink: CADisplayLink?
+
+  // var captureSession: AVCaptureSession!
+  private lazy var captureSession = AVCaptureSession()
+  var previewLayer: AVCaptureVideoPreviewLayer!
+  var poseDetectorVideo: PoseDetector!
+
+  private var lastFrame: CMSampleBuffer?
+
+    private lazy var previewOverlayView: UIImageView = {
+
+      precondition(isViewLoaded)
+      let previewOverlayView = UIImageView(frame: .zero)
+      previewOverlayView.contentMode = UIView.ContentMode.scaleAspectFill
+      previewOverlayView.translatesAutoresizingMaskIntoConstraints = false
+      return previewOverlayView
+    }()
+
+  private lazy var sessionQueue = DispatchQueue(label: Constant.sessionQueueLabel)
 
   /// Initialized when one of the pose detector rows are chosen. Reset to `nil` when neither are.
   private var poseDetector: PoseDetector? = nil
 
   /// Initialized when a segmentation row is chosen. Reset to `nil` otherwise.
   private var segmenter: Segmenter? = nil
-
+    
   /// The detector row with which detection was most recently run. Useful for inferring when to
   /// reset detector instances which use a conventional lifecyle paradigm.
   private var lastDetectorRow: DetectorPickerRow?
@@ -55,6 +84,7 @@ class ViewController: UIViewController, UINavigationControllerDelegate {
   @IBOutlet fileprivate weak var detectorPicker: UIPickerView!
 
   @IBOutlet fileprivate weak var imageView: UIImageView!
+  @IBOutlet fileprivate weak var playerViewController: AVPlayerViewController?
   @IBOutlet fileprivate weak var photoCameraButton: UIBarButtonItem!
   @IBOutlet fileprivate weak var videoCameraButton: UIBarButtonItem!
   @IBOutlet weak var detectButton: UIBarButtonItem!
@@ -64,6 +94,11 @@ class ViewController: UIViewController, UINavigationControllerDelegate {
   override func viewDidLoad() {
     super.viewDidLoad()
 
+      
+    // Create AVCaptureSession
+    // captureSession = AVCaptureSession()
+    previewLayer = AVCaptureVideoPreviewLayer(session: captureSession)
+      
     imageView.image = UIImage(named: Constants.images[currentImage])
     imageView.addSubview(annotationOverlayView)
     NSLayoutConstraint.activate([
@@ -94,18 +129,21 @@ class ViewController: UIViewController, UINavigationControllerDelegate {
 
     let defaultRow = (DetectorPickerRow.rowsCount / 2) - 1
     detectorPicker.selectRow(defaultRow, inComponent: 0, animated: false)
+
   }
 
   override func viewWillAppear(_ animated: Bool) {
     super.viewWillAppear(animated)
 
     navigationController?.navigationBar.isHidden = true
+    startSession()
   }
 
   override func viewWillDisappear(_ animated: Bool) {
     super.viewWillDisappear(animated)
 
     navigationController?.navigationBar.isHidden = false
+    stopSession()
   }
 
   // MARK: - IBActions
@@ -116,57 +154,9 @@ class ViewController: UIViewController, UINavigationControllerDelegate {
     if let rowIndex = DetectorPickerRow(rawValue: row) {
       resetManagedLifecycleDetectors(activeDetectorRow: rowIndex)
 
-      let shouldEnableClassification =
-        (rowIndex == .detectObjectsProminentWithClassifier)
-        || (rowIndex == .detectObjectsMultipleWithClassifier)
-        || (rowIndex == .detectObjectsCustomProminentWithClassifier)
-        || (rowIndex == .detectObjectsCustomMultipleWithClassifier)
-      let shouldEnableMultipleObjects =
-        (rowIndex == .detectObjectsMultipleWithClassifier)
-        || (rowIndex == .detectObjectsMultipleNoClassifier)
-        || (rowIndex == .detectObjectsCustomMultipleWithClassifier)
-        || (rowIndex == .detectObjectsCustomMultipleNoClassifier)
       switch rowIndex {
-      case .detectFaceOnDevice:
-        detectFaces(image: imageView.image)
-      case .detectTextOnDevice, .detectTextChineseOnDevice, .detectTextDevanagariOnDevice,
-        .detectTextJapaneseOnDevice, .detectTextKoreanOnDevice:
-        detectTextOnDevice(
-          image: imageView.image, detectorType: rowIndex)
-      case .detectBarcodeOnDevice:
-        detectBarcodes(image: imageView.image)
-      case .detectImageLabelsOnDevice:
-        detectLabels(image: imageView.image, shouldUseCustomModel: false)
-      case .detectImageLabelsCustomOnDevice:
-        detectLabels(image: imageView.image, shouldUseCustomModel: true)
-      case .detectObjectsProminentNoClassifier, .detectObjectsProminentWithClassifier,
-        .detectObjectsMultipleNoClassifier, .detectObjectsMultipleWithClassifier:
-        let options = ObjectDetectorOptions()
-        options.shouldEnableClassification = shouldEnableClassification
-        options.shouldEnableMultipleObjects = shouldEnableMultipleObjects
-        options.detectorMode = .singleImage
-        detectObjectsOnDevice(in: imageView.image, options: options)
-      case .detectObjectsCustomProminentNoClassifier, .detectObjectsCustomProminentWithClassifier,
-        .detectObjectsCustomMultipleNoClassifier, .detectObjectsCustomMultipleWithClassifier:
-        guard
-          let localModelFilePath = Bundle.main.path(
-            forResource: Constants.localModelFile.name,
-            ofType: Constants.localModelFile.type
-          )
-        else {
-          print("Failed to find custom local model file.")
-          return
-        }
-        let localModel = LocalModel(path: localModelFilePath)
-        let options = CustomObjectDetectorOptions(localModel: localModel)
-        options.shouldEnableClassification = shouldEnableClassification
-        options.shouldEnableMultipleObjects = shouldEnableMultipleObjects
-        options.detectorMode = .singleImage
-        detectObjectsOnDevice(in: imageView.image, options: options)
       case .detectPose, .detectPoseAccurate:
         detectPose(image: imageView.image)
-      case .detectSegmentationMaskSelfie:
-        detectSegmentationMask(image: imageView.image)
       }
     } else {
       print("No such item at row \(row) in detector picker.")
@@ -196,6 +186,329 @@ class ViewController: UIViewController, UINavigationControllerDelegate {
     imageView.image = UIImage(named: Constants.images[currentImage])
   }
 
+  @IBAction func changeMedia(_ sender: Any) {
+      clearResults()
+
+      // Assuming Constants.media is an array containing both image and video names
+      currentMedia = (currentMedia + 1) % Constants.media.count
+
+      let mediaName = Constants.media[currentMedia]
+
+      stopVideo()
+      
+      if mediaName.hasSuffix(".mp4") {
+          // Selected media is a video
+          imageView.image = nil
+          playVideo(named: mediaName)
+      } else {
+          // Selected media is an image
+          imageView.image = UIImage(named: mediaName)
+      }
+  }
+
+  func playVideo(named videoName: String) {
+      // let videoName = (videoName as NSString).deletingPathExtension
+      // // Get the URL of the video file
+      // if let videoURL = Bundle.main.url(forResource: videoName, withExtension: "mp4") {
+      //     // Create AVPlayer and AVPlayerLayer
+      //     player = AVPlayer(url: videoURL)
+      //     playerLayer = AVPlayerLayer(player: player)
+
+      //     // Set up playerLayer frame and add it to the view
+      //     playerLayer?.frame = imageView.bounds
+      //     imageView.layer.addSublayer(playerLayer!)
+
+      //     // Start playing the video
+      //     player?.play()
+      // } else {
+      //     print("Video file not found.")
+      // }
+
+    // let videoName = (videoName as NSString).deletingPathExtension
+
+    // guard let videoURL = Bundle.main.url(forResource: videoName, withExtension: "mp4") else {
+    //     print("Video file not found.")
+    //     return
+    // }
+
+    // let asset = AVAsset(url: videoURL)
+    // let playerItem = AVPlayerItem(asset: asset)
+    // videoOutput = AVPlayerItemVideoOutput()
+
+    // playerItem.add(videoOutput!)
+    // player = AVPlayer(playerItem: playerItem)
+    // playerLayer = AVPlayerLayer(player: player)
+    // playerLayer?.frame = imageView.bounds
+    // imageView.layer.addSublayer(playerLayer!)
+
+    // // Add observer for when the video ends
+    // NotificationCenter.default.addObserver(self, selector: #selector(videoDidEnd), name: .AVPlayerItemDidPlayToEndTime, object: playerItem)
+
+    // player?.play()
+
+    // setupVideoProcessing()
+
+  let videoName = (videoName as NSString).deletingPathExtension
+
+  // Get the URL of the video file
+  guard let videoURL = Bundle.main.url(forResource: videoName, withExtension: "mp4") else {
+      print("Video file not found.")
+      return
+  }
+
+  // Create AVPlayer
+  player = AVPlayer(url: videoURL)
+
+  // Create AVAssetReader
+  do {
+      let asset = AVURLAsset(url: videoURL)
+      let reader = try AVAssetReader(asset: asset)
+      let videoOutput = AVAssetReaderTrackOutput(track: asset.tracks(withMediaType: .video)[0], outputSettings: nil)
+      reader.add(videoOutput)
+
+      // Set up AVCaptureVideoDataOutput to capture video frames
+      let videoOutputForSession = AVCaptureVideoDataOutput()
+      videoOutputForSession.setSampleBufferDelegate(self, queue: DispatchQueue(label: "videoFrameQueue"))
+
+//      if captureSession.canAddInput(AVCaptureDeviceInput(device: AVCaptureDevice.default(for: .video)!)) {
+//        captureSession.addInput(AVCaptureDeviceInput(device: AVCaptureDevice.default(for: .video)!))
+//      }
+
+      let videoDevice = AVCaptureDevice.default(for: .video)
+//      if let videoDevice = AVCaptureDevice.default(for: .video) {
+//          do {
+//              let videoInput = try AVCaptureDeviceInput(device: videoDevice)
+//              if captureSession.canAddInput(videoInput) {
+//                  captureSession.addInput(videoInput)
+//              }
+//          } catch {
+//              print("Error adding video input: \(error.localizedDescription)")
+//          }
+//      }
+      
+      if captureSession.canAddOutput(videoOutputForSession) {
+        captureSession.addOutput(videoOutputForSession)
+      }
+
+      // Set up playerLayer frame and add it to the view
+      // previewLayer = AVCaptureVideoPreviewLayer(session: captureSession)
+
+
+//      previewLayer.videoGravity = .resizeAspectFill
+//      previewLayer.frame = self.view.layer.bounds
+//      self.view.layer.addSublayer(previewLayer)
+
+      // player = AVPlayer(url: videoURL)
+       playerLayer = AVPlayerLayer(player: player)
+
+      // // Set up playerLayer frame and add it to the view
+       playerLayer?.frame = imageView.bounds
+       imageView.layer.addSublayer(playerLayer!)
+
+      previewLayer.frame = imageView.bounds
+      imageView.layer.addSublayer(previewLayer)
+      
+      // Start playing the video
+      player?.play()
+
+      // Start the AVCaptureSession
+//      captureSession.startRunning()
+      startSession()
+
+  } catch {
+      print("Error creating AVAssetReader: \(error.localizedDescription)")
+  }
+
+}
+
+  private func startSession() {
+    weak var weakSelf = self
+    sessionQueue.async {
+      guard let strongSelf = weakSelf else {
+        print("Self is nil!")
+        return
+      }
+      strongSelf.captureSession.startRunning()
+    }
+  }
+
+  private func stopSession() {
+    weak var weakSelf = self
+    sessionQueue.async {
+      guard let strongSelf = weakSelf else {
+        print("Self is nil!")
+        return
+      }
+      strongSelf.captureSession.stopRunning()
+    }
+  }
+
+  func stopVideo() {
+    player?.pause()
+    playerLayer?.removeFromSuperlayer()
+  }
+
+  @objc func videoDidEnd() {
+    // Video playback has ended
+    displayLink?.invalidate()
+    stopVideo()
+  }
+
+  func setupVideoProcessing() {
+      displayLink = CADisplayLink(target: self, selector: #selector(processNextFrame))
+      displayLink?.add(to: .main, forMode: .default)
+  }
+
+  @objc func processNextFrame() {
+      guard let pixelBuffer = videoOutput?.copyPixelBuffer(forItemTime: player?.currentItem?.currentTime() ?? CMTime.zero, itemTimeForDisplay: nil) else {
+          return
+      }
+
+      // Convert pixelBuffer to UIImage or CIImage and pass it to ML Kit pose detection
+      let image = CIImage(cvPixelBuffer: pixelBuffer)
+      detectPoses(in: image)
+  }
+  
+  func detectPoses(in image: CIImage) {
+    guard let cgImage = CIContext().createCGImage(image, from: image.extent) else {
+      print("Error converting CIImage to CGImage.")
+      return
+    }
+
+    // Convert CGImage to UIImage
+    let uiImage = UIImage(cgImage: cgImage)
+
+    // Create VisionImage using UIImage
+    let visionImage = VisionImage(image: uiImage)
+
+    let options = PoseDetectorOptions()
+    options.detectorMode = .stream
+
+//    let poseDetector = PoseDetector.poseDetector(options: options)
+      self.poseDetectorVideo = PoseDetector.poseDetector(options: options)
+            
+      self.poseDetectorVideo.process(visionImage) { poses, error in
+      guard error == nil, let poses = poses, !poses.isEmpty else {
+        print("Error detecting poses: \(error?.localizedDescription ?? "Unknown error")")
+        return
+      }
+
+      // Get the first pose detected
+      let pose = poses[0]
+
+      // Get the landmarks of the pose
+      let landmarks = pose.landmarks
+
+      // Create a new layer to draw the landmarks on
+      let overlayLayer = CALayer()
+      overlayLayer.frame = self.imageView.bounds
+
+      // Loop through each landmark and draw a circle at its position
+      for landmark in landmarks {
+        let landmarkLayer = CALayer()
+        landmarkLayer.frame = CGRect(x: landmark.position.x - 5, y: landmark.position.y - 5, width: 10, height: 10)
+        landmarkLayer.cornerRadius = 5
+        landmarkLayer.backgroundColor = UIColor.red.cgColor
+        overlayLayer.addSublayer(landmarkLayer)
+      }
+
+      // Add the overlay layer to the image view
+      self.imageView.layer.addSublayer(overlayLayer)
+    }
+  }
+  
+func captureOutput(
+    _ output: AVCaptureOutput,
+    didOutput sampleBuffer: CMSampleBuffer,
+    from connection: AVCaptureConnection
+  ) {
+    guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+      print("Failed to get image buffer from sample buffer.")
+      return
+    }
+    // Evaluate `self.currentDetector` once to ensure consistency throughout this method since it
+    // can be concurrently modified from the main thread.
+    // let activeDetector = self.currentDetector
+    // resetManagedLifecycleDetectors(activeDetector: activeDetector)
+
+    lastFrame = sampleBuffer
+    let visionImage = VisionImage(buffer: sampleBuffer)
+    // let image = CIImage(CMSampleBuffer: sampleBuffer)
+    // let context = CIContext(options: nil)
+    // let cgImage = context.createCGImage(image, from: image.extent)!
+    // let uiImage = UIImage(cgImage: cgImage)
+    let orientation = UIUtilities.imageOrientation(
+      fromDevicePosition: .back
+    )
+    visionImage.orientation = orientation
+
+    guard let inputImage = MLImage(sampleBuffer: sampleBuffer) else {
+      print("Failed to create MLImage from sample buffer.")
+      return
+    }
+    inputImage.orientation = orientation
+
+    let imageWidth = CGFloat(CVPixelBufferGetWidth(imageBuffer))
+    let imageHeight = CGFloat(CVPixelBufferGetHeight(imageBuffer))
+//    var shouldEnableClassification = false
+//    var shouldEnableMultipleObjects = false
+
+    detectPose(in: inputImage, width: imageWidth, height: imageHeight)
+  }
+
+  private func detectPose(in image: MLImage, width: CGFloat, height: CGFloat) {
+      if let poseDetector = self.poseDetectorVideo {
+        var poses: [Pose] = []
+        var detectionError: Error?
+        do {
+          poses = try poseDetector.results(in: image)
+        } catch let error {
+          detectionError = error
+        }
+        weak var weakSelf = self
+        DispatchQueue.main.sync {
+          guard let strongSelf = weakSelf else {
+            print("Self is nil!")
+            return
+          }
+          strongSelf.updatePreviewOverlayViewWithLastFrame()
+          if let detectionError = detectionError {
+            print("Failed to detect poses with error: \(detectionError.localizedDescription).")
+            return
+          }
+          guard !poses.isEmpty else {
+            print("Pose detector returned no results.")
+            return
+          }
+
+          // Pose detected. Currently, only single person detection is supported.
+          poses.forEach { pose in
+            let poseOverlayView = UIUtilities.createPoseOverlayView(
+              forPose: pose,
+              inViewWithBounds: strongSelf.annotationOverlayView.bounds,
+              lineWidth: Constant.lineWidth,
+              dotRadius: Constant.smallDotRadius,
+              positionTransformationClosure: { (position) -> CGPoint in
+                return strongSelf.normalizedPoint(
+                  fromVisionPoint: position, width: width, height: height)
+              }
+            )
+            strongSelf.annotationOverlayView.addSubview(poseOverlayView)
+          }
+        }
+      }
+    }
+
+  private func updatePreviewOverlayViewWithLastFrame() {
+    guard let lastFrame = lastFrame,
+      let imageBuffer = CMSampleBufferGetImageBuffer(lastFrame)
+    else {
+      return
+    }
+    self.updatePreviewOverlayViewWithImageBuffer(imageBuffer)
+    self.removeDetectionAnnotations()
+  }
+
   @IBAction func downloadOrDeleteModel(_ sender: Any) {
     clearResults()
   }
@@ -207,6 +520,26 @@ class ViewController: UIViewController, UINavigationControllerDelegate {
     for annotationView in annotationOverlayView.subviews {
       annotationView.removeFromSuperview()
     }
+  }
+
+  private func updatePreviewOverlayViewWithImageBuffer(_ imageBuffer: CVImageBuffer?) {
+    guard let imageBuffer = imageBuffer else {
+      return
+    }
+    let orientation: UIImage.Orientation = .right
+    let image = UIUtilities.createUIImage(from: imageBuffer, orientation: orientation)
+    previewOverlayView.image = image
+  }
+
+  private func normalizedPoint(
+    fromVisionPoint point: VisionPoint,
+    width: CGFloat,
+    height: CGFloat
+  ) -> CGPoint {
+    let cgPoint = CGPoint(x: point.x, y: point.y)
+    var normalizedPoint = CGPoint(x: cgPoint.x / width, y: cgPoint.y / height)
+    normalizedPoint = previewLayer.layerPointConverted(fromCaptureDevicePoint: normalizedPoint)
+    return normalizedPoint
   }
 
   /// Clears the results text view and removes any frames that are visible.
@@ -638,27 +971,58 @@ extension ViewController: UIPickerViewDataSource, UIPickerViewDelegate {
 
 // MARK: - UIImagePickerControllerDelegate
 
+// extension ViewController: UIImagePickerControllerDelegate {
+
+//   func imagePickerController(
+//     _ picker: UIImagePickerController,
+//     didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]
+//   ) {
+//     // Local variable inserted by Swift 4.2 migrator.
+//     let info = convertFromUIImagePickerControllerInfoKeyDictionary(info)
+
+//     clearResults()
+//     if let pickedImage =
+//       info[
+//         convertFromUIImagePickerControllerInfoKey(UIImagePickerController.InfoKey.originalImage)]
+//       as? UIImage
+//     {
+//       updateImageView(with: pickedImage)
+//     }
+//     dismiss(animated: true)
+//   }
+// }
+
 extension ViewController: UIImagePickerControllerDelegate {
 
-  func imagePickerController(
-    _ picker: UIImagePickerController,
-    didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]
-  ) {
-    // Local variable inserted by Swift 4.2 migrator.
-    let info = convertFromUIImagePickerControllerInfoKeyDictionary(info)
+    func imagePickerController(
+        _ picker: UIImagePickerController,
+        didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]
+    ) {
+        // Local variable inserted by Swift 4.2 migrator.
+        let info = convertFromUIImagePickerControllerInfoKeyDictionary(info)
 
-    clearResults()
-    if let pickedImage =
-      info[
-        convertFromUIImagePickerControllerInfoKey(UIImagePickerController.InfoKey.originalImage)]
-      as? UIImage
-    {
-      updateImageView(with: pickedImage)
+        clearResults()
+
+        if let mediaType = info[convertFromUIImagePickerControllerInfoKey(UIImagePickerController.InfoKey.mediaType)] as? String {
+            
+            if mediaType == kUTTypeImage as String {
+                // Handle selected image
+                if let pickedImage = info[convertFromUIImagePickerControllerInfoKey(UIImagePickerController.InfoKey.originalImage)] as? UIImage {
+                    updateImageView(with: pickedImage)
+                }
+            } else if mediaType == kUTTypeMovie as String {
+                // Handle selected video
+                if let videoURL = info[convertFromUIImagePickerControllerInfoKey(UIImagePickerController.InfoKey.mediaURL)] as? URL {
+                    // Use the videoURL to perform actions with the selected video
+                    // For example, you can play the video or do something else
+                    print("Selected video URL: \(videoURL)")
+                }
+            }
+        }
+
+        dismiss(animated: true)
     }
-    dismiss(animated: true)
-  }
 }
-
 /// Extension of ViewController for On-Device detection.
 extension ViewController {
 
@@ -838,6 +1202,59 @@ extension ViewController {
     }
   }
 
+func detectPoseFromVideo(videoURL: URL) {
+  let asset = AVAsset(url: videoURL)
+  let reader = try! AVAssetReader(asset: asset)
+  let videoTrack = asset.tracks(withMediaType: .video)[0]
+  let outputSettings: [String: Any] = [
+    kCVPixelBufferPixelFormatTypeKey as String: NSNumber(value: kCVPixelFormatType_32BGRA)
+  ]
+  let readerOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: outputSettings)
+  readerOutput.alwaysCopiesSampleData = false
+  reader.add(readerOutput)
+  reader.startReading()
+
+  let transform = transformMatrix()
+
+  while let sampleBuffer = readerOutput.copyNextSampleBuffer() {
+    guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else {
+      continue
+    }
+    let imageWidth = CGFloat(CVPixelBufferGetWidth(pixelBuffer))
+    let imageHeight = CGFloat(CVPixelBufferGetHeight(pixelBuffer))
+    let image = CIImage(cvPixelBuffer: pixelBuffer)
+    let context = CIContext(options: nil)
+    let cgImage = context.createCGImage(image, from: image.extent)!
+    let uiImage = UIImage(cgImage: cgImage)
+    let inputImage = MLImage(image: uiImage)!
+    inputImage.orientation = uiImage.imageOrientation
+    
+    if let poseDetector = self.poseDetector {
+      poseDetector.process(inputImage) { poses, error in
+        guard error == nil, let poses = poses, !poses.isEmpty else {
+          let errorString = error?.localizedDescription ?? Constants.detectionNoResultsMessage
+          self.resultsText = "Pose detection failed with error: \(errorString)"
+          self.showResults()
+          return
+        }
+        poses.forEach { pose in
+            let poseOverlayView = UIUtilities.createPoseOverlayViewVideo(
+              forPose: pose,
+              inViewWithBounds: self.annotationOverlayView.bounds,
+              lineWidth: Constants.lineWidth,
+              fillColor: UIColor.yellow.withAlphaComponent(Constant.fillOpacity),
+              strokeColor: UIColor.red.withAlphaComponent(Constant.strokeOpacity),
+              dotRadius: Constants.smallDotRadius,
+              transform: transform)
+            self.annotationOverlayView.addSubview(poseOverlayView)
+        }
+        self.resultsText = "Pose detection succeeded"
+        self.showResults()
+      }
+    }
+  }
+}
+
   /// Detects barcodes on the specified image and draws a frame around the detected barcodes using
   /// On-Device barcode API.
   ///
@@ -961,33 +1378,6 @@ extension ViewController {
   /// On-Device text recognizer.
   ///
   /// - Parameter image: The image.
-  private func detectTextOnDevice(image: UIImage?, detectorType: DetectorPickerRow) {
-    guard let image = image else { return }
-
-    // [START init_text]
-    var options: CommonTextRecognizerOptions
-    if detectorType == .detectTextChineseOnDevice {
-      options = ChineseTextRecognizerOptions.init()
-    } else if detectorType == .detectTextDevanagariOnDevice {
-      options = DevanagariTextRecognizerOptions.init()
-    } else if detectorType == .detectTextJapaneseOnDevice {
-      options = JapaneseTextRecognizerOptions.init()
-    } else if detectorType == .detectTextKoreanOnDevice {
-      options = KoreanTextRecognizerOptions.init()
-    } else {
-      options = TextRecognizerOptions.init()
-    }
-
-    let onDeviceTextRecognizer = TextRecognizer.textRecognizer(options: options)
-    // [END init_text]
-
-    // Initialize a `VisionImage` object with the given `UIImage`.
-    let visionImage = VisionImage(image: image)
-    visionImage.orientation = image.imageOrientation
-
-    self.resultsText += "Running On-Device Text Recognition...\n"
-    process(visionImage, with: onDeviceTextRecognizer)
-  }
 
   /// Detects objects on the specified image and draws a frame around them.
   ///
@@ -1073,9 +1463,6 @@ extension ViewController {
     case .detectPose, .detectPoseAccurate:
       self.poseDetector = nil
       break
-    case .detectSegmentationMaskSelfie:
-      self.segmenter = nil
-      break
     default:
       break
     }
@@ -1086,15 +1473,10 @@ extension ViewController {
         activeDetectorRow == .detectPose
         ? PoseDetectorOptions()
         : AccuratePoseDetectorOptions()
+      self.poseDetectorVideo = PoseDetector.poseDetector(options: options)
       options.detectorMode = .singleImage
       self.poseDetector = PoseDetector.poseDetector(options: options)
-      break
-    case .detectSegmentationMaskSelfie:
-      let options = SelfieSegmenterOptions()
-      options.segmenterMode = .singleImage
-      self.segmenter = Segmenter.segmenter(options: options)
-      break
-    default:
+
       break
     }
     self.lastDetectorRow = activeDetectorRow
@@ -1104,86 +1486,40 @@ extension ViewController {
 // MARK: - Enums
 
 private enum DetectorPickerRow: Int {
-  case detectFaceOnDevice = 0
+  case detectPose = 0
 
   case
-    detectTextOnDevice,
-    detectTextChineseOnDevice,
-    detectTextDevanagariOnDevice,
-    detectTextJapaneseOnDevice,
-    detectTextKoreanOnDevice,
-    detectBarcodeOnDevice,
-    detectImageLabelsOnDevice,
-    detectImageLabelsCustomOnDevice,
-    detectObjectsProminentNoClassifier,
-    detectObjectsProminentWithClassifier,
-    detectObjectsMultipleNoClassifier,
-    detectObjectsMultipleWithClassifier,
-    detectObjectsCustomProminentNoClassifier,
-    detectObjectsCustomProminentWithClassifier,
-    detectObjectsCustomMultipleNoClassifier,
-    detectObjectsCustomMultipleWithClassifier,
-    detectPose,
-    detectPoseAccurate,
-    detectSegmentationMaskSelfie
+    detectPoseAccurate
 
-  static let rowsCount = 20
+  static let rowsCount = 2
   static let componentsCount = 1
 
   public var description: String {
     switch self {
-    case .detectFaceOnDevice:
-      return "Face Detection"
-    case .detectTextOnDevice:
-      return "Text Recognition"
-    case .detectTextChineseOnDevice:
-      return "Text Recognition Chinese"
-    case .detectTextDevanagariOnDevice:
-      return "Text Recognition Devanagari"
-    case .detectTextJapaneseOnDevice:
-      return "Text Recognition Japanese"
-    case .detectTextKoreanOnDevice:
-      return "Text Recognition Korean"
-    case .detectBarcodeOnDevice:
-      return "Barcode Scanning"
-    case .detectImageLabelsOnDevice:
-      return "Image Labeling"
-    case .detectImageLabelsCustomOnDevice:
-      return "Image Labeling Custom"
-    case .detectObjectsProminentNoClassifier:
-      return "ODT, single, no labeling"
-    case .detectObjectsProminentWithClassifier:
-      return "ODT, single, labeling"
-    case .detectObjectsMultipleNoClassifier:
-      return "ODT, multiple, no labeling"
-    case .detectObjectsMultipleWithClassifier:
-      return "ODT, multiple, labeling"
-    case .detectObjectsCustomProminentNoClassifier:
-      return "ODT, custom, single, no labeling"
-    case .detectObjectsCustomProminentWithClassifier:
-      return "ODT, custom, single, labeling"
-    case .detectObjectsCustomMultipleNoClassifier:
-      return "ODT, custom, multiple, no labeling"
-    case .detectObjectsCustomMultipleWithClassifier:
-      return "ODT, custom, multiple, labeling"
     case .detectPose:
       return "Pose Detection"
     case .detectPoseAccurate:
       return "Pose Detection, accurate"
-    case .detectSegmentationMaskSelfie:
-      return "Selfie Segmentation"
     }
   }
 }
 
 private enum Constants {
-  static let images = [
-    "grace_hopper.jpg", "image_has_text.jpg", "chinese_sparse.png", "chinese.png",
-    "devanagari_sparse.png", "devanagari.png", "japanese_sparse.png", "japanese.png",
-    "korean_sparse.png", "korean.png", "barcode_128.png", "qr_code.jpg", "beach.jpg", "liberty.jpg",
-    "bird.jpg",
-  ]
+//  static let images = [
+//    "grace_hopper.jpg", "image_has_text.jpg", "chinese_sparse.png", "chinese.png",
+//    "devanagari_sparse.png", "devanagari.png", "japanese_sparse.png", "japanese.png",
+//    "korean_sparse.png", "korean.png", "barcode_128.png", "qr_code.jpg", "beach.jpg", "liberty.jpg",
+//    "bird.jpg",
+//  ]
 
+    static let images = [
+      "pushup.jpeg", "squat.jpeg", "leg_lift.jpeg",
+    ]
+
+  static let videos = ["production_id_4065502.mp4"]
+
+  static let media: [String] = images + videos
+    
   static let detectionNoResultsMessage = "No results returned."
   static let failedToDetectObjectsMessage = "Failed to detect objects in image."
   static let localModelFile = (name: "bird", type: "tflite")
@@ -1208,4 +1544,28 @@ private func convertFromUIImagePickerControllerInfoKey(_ input: UIImagePickerCon
   -> String
 {
   return input.rawValue
+}
+
+private enum Constant {
+  static let alertControllerTitle = "Vision Detectors"
+  static let alertControllerMessage = "Select a detector"
+  static let cancelActionTitleText = "Cancel"
+  static let videoDataOutputQueueLabel = "com.google.mlkit.visiondetector.VideoDataOutputQueue"
+  static let sessionQueueLabel = "com.google.mlkit.visiondetector.SessionQueue"
+  static let noResultsMessage = "No Results"
+  static let localModelFile = (name: "bird", type: "tflite")
+  static let labelConfidenceThreshold = 0.75
+  static let smallDotRadius: CGFloat = 4.0
+  static let lineWidth: CGFloat = 3.0
+  static let originalScale: CGFloat = 1.0
+  static let padding: CGFloat = 10.0
+  static let resultsLabelHeight: CGFloat = 200.0
+  static let resultsLabelLines = 5
+  static let imageLabelResultFrameX = 0.4
+  static let imageLabelResultFrameY = 0.1
+  static let imageLabelResultFrameWidth = 0.5
+  static let imageLabelResultFrameHeight = 0.8
+  static let segmentationMaskAlpha: CGFloat = 0.5
+  static let fillOpacity: CGFloat = 0.5
+  static let strokeOpacity: CGFloat = 0.5
 }

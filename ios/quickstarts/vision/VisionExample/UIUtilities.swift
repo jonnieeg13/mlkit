@@ -361,6 +361,47 @@ public class UIUtilities {
     return overlayView
   }
 
+public static func createPoseOverlayViewVideo(
+    forPose pose: Pose,
+    inViewWithBounds bounds: CGRect,
+    lineWidth: CGFloat,
+    fillColor: UIColor,
+    strokeColor: UIColor,
+    dotRadius: CGFloat,
+    transform: CGAffineTransform
+  ) -> UIView {
+    let overlayView = UIView(frame: bounds)
+
+//    for (startLandmarkType, endLandmarkTypesArray) in UIUtilities.poseConnections() {
+//      let startLandmark = pose.landmark(ofType: startLandmarkType)
+//      for endLandmarkType in endLandmarkTypesArray {
+//        let endLandmark = pose.landmark(ofType: endLandmarkType)
+//        let startLandmarkPoint = startLandmark.position.scaled(to: bounds.size).applying(transform)
+//        let endLandmarkPoint = endLandmark.position.scaled(to: bounds.size).applying(transform)
+//
+//        UIUtilities.addLineSegment(
+//          fromPoint: startLandmarkPoint,
+//          toPoint: endLandmarkPoint,
+//          inView: overlayView,
+//          colors: [strokeColor],
+//          width: lineWidth)
+//      }
+//    }
+//
+//    for landmark in pose.landmarks {
+//      let landmarkPoint = landmark.position.scaled(to: bounds.size).applying(transform)
+//      UIUtilities.addCircle(
+//        atPoint: landmarkPoint,
+//        to: overlayView,
+//        color: fillColor,
+//        radius: dotRadius
+//      )
+//    }
+
+    return overlayView
+}
+
+
   /// Adds a gradient-colored line segment subview in a given `view`.
   ///
   /// - Parameters:
@@ -563,3 +604,12 @@ extension CGRect {
       !(origin.x.isNaN || origin.y.isNaN || width.isNaN || height.isNaN || width < 0 || height < 0)
   }
 }
+
+// extension CGSize {
+//     func scale(point: Vision3DPoint) -> Vision3DPoint {
+//         let newX = point.x * Float(self.width)
+//         let newY = point.y * Float(self.height)
+//         let newZ = point.z // Assuming you don't want to scale the z coordinate
+//         return Vision3DPoint(x: newX, y: newY, z: newZ)
+//     }
+// }
